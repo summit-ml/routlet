@@ -3,8 +3,10 @@ name: Release
 # Publishes the platform packages and then the main package when a version tag
 # is pushed. The tag must match the version in package.json (v0.1.0 for 0.1.0).
 #
-# Publishing uses npm trusted publishing: configure this repository and workflow
-# as a trusted publisher for each package on npmjs.com, and no token is stored.
+# Publishing uses npm trusted publishing, so no token is stored. On npmjs.com,
+# each of the five packages must list this repository and this workflow file
+# (release.yml) as a trusted publisher. That can only be set up once a package
+# exists, so the very first version is published by hand.
 
 on:
   push:
@@ -45,7 +47,7 @@ jobs:
       - name: Publish platform packages
         run: |
           for dir in npm/*/; do
-            npm publish "$dir" --access public --provenance
+            npm publish "$dir" --access public
           done
       - name: Publish main package
-        run: npm publish --access public --provenance
+        run: npm publish --access public

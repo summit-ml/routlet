@@ -43,7 +43,8 @@
     "build:helper": "cd helper && go build -o bin/routlet-helper .",
     "build:packages": "node scripts/build-packages.mjs",
     "test": "node --test test/*.test.ts",
-    "prepack": "npm run build"
+    "prepack": "npm run build",
+    "set-version": "node scripts/set-version.mjs"
   },
   "optionalDependencies": {
     "@summitml/routlet-darwin-arm64": "0.1.0",

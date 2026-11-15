@@ -222,6 +222,14 @@ on), listed as optional dependencies of the main package so npm installs only th
 npm run build:packages     # cross-compile every platform's helper into npm/
 ```
 
-To release, set the same new version in `version` and in every `optionalDependencies` entry of
-`package.json`, commit, and push a tag named `v<version>`. The Release workflow tests, builds, and
-publishes the platform packages followed by the main package.
+To release a new version:
+
+```bash
+npm run set-version 0.2.0      # updates the version everywhere it appears
+git commit -am "Release 0.2.0" && git push
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Pushing the tag starts the Release workflow, which tests, builds, and publishes the platform
+packages followed by the main package. It publishes through npm trusted publishing, so each of the
+five packages must list this repository and `release.yml` as a trusted publisher on npmjs.com.

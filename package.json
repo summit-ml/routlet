@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "description": "Named dev services. Any port. Any network.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/summit-ml/routlet.git"
+  },
+  "homepage": "https://github.com/summit-ml/routlet#readme",
+  "bugs": {
+    "url": "https://github.com/summit-ml/routlet/issues"
+  },
   "keywords": [
     "tailscale",
     "dev-server",

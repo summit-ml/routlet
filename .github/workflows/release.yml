@@ -47,7 +47,7 @@ jobs:
       - name: Publish platform packages
         run: |
           for dir in npm/*/; do
-            npm publish "$dir" --access public
+            npm publish "./$dir" --access public
           done
       - name: Publish main package
         run: npm publish --access public

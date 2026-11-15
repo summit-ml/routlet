@@ -1,9 +1,16 @@
 {
   "name": "@summitml/routlet",
   "version": "0.1.0",
-  "private": true,
   "description": "Named dev services. Any port. Any network.",
   "license": "MIT",
+  "keywords": [
+    "tailscale",
+    "dev-server",
+    "proxy",
+    "https",
+    "localhost",
+    "ports"
+  ],
   "type": "module",
   "bin": {
     "routlet": "dist/cli.js"
@@ -17,7 +24,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=24"
@@ -25,7 +33,15 @@
   "scripts": {
     "build": "tsc",
     "build:helper": "cd helper && go build -o bin/routlet-helper .",
-    "test": "node --test test/*.test.ts"
+    "build:packages": "node scripts/build-packages.mjs",
+    "test": "node --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "optionalDependencies": {
+    "@summitml/routlet-darwin-arm64": "0.1.0",
+    "@summitml/routlet-darwin-x64": "0.1.0",
+    "@summitml/routlet-linux-x64": "0.1.0",
+    "@summitml/routlet-linux-arm64": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

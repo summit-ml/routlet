@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: helper/go.mod
+          cache-dependency-path: helper/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      # Port discovery for apps that ignore PORT uses lsof.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y lsof
+      - run: npm ci
+      - run: npm run build
+      - run: npm run build:helper
+      - run: npm test
+      # Every platform's helper must cross-compile, whichever host this is.
+      - run: npm run build:packages

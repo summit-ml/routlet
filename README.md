@@ -212,3 +212,16 @@ npm link            # optional: use this checkout as the global `routlet`
 
 Tests use the `local` ingress, so they need no Tailscale account. The gateway logs to
 `~/.local/state/routlet/gateway.log`; set `ROUTLET_DEBUG=1` before it starts for verbose output.
+
+### Releasing
+
+The helper binary ships as one small package per platform (`@summitml/routlet-darwin-arm64` and so
+on), listed as optional dependencies of the main package so npm installs only the matching one.
+
+```bash
+npm run build:packages     # cross-compile every platform's helper into npm/
+```
+
+To release, set the same new version in `version` and in every `optionalDependencies` entry of
+`package.json`, commit, and push a tag named `v<version>`. The Release workflow tests, builds, and
+publishes the platform packages followed by the main package.

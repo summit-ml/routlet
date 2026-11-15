@@ -126,18 +126,32 @@ async function ensureApproved(secret: string, name: string, hostId: string): Pro
 }
 
 /**
- * Restore approval for a running service if it has been withdrawn, for example
- * by a policy change. Without this the URL would stay dead, silently, until the
- * service was next restarted.
+ * Check that this machine may still serve a running service. Approval can be
+ * withdrawn while a service is up, for example by a policy change, and the URL
+ * would then stay dead, silently, until the service was next restarted.
+ *
+ * Returns 'ok', 'restored', or a description of why the URL is believed down.
+ * Returns undefined when nothing could be learned, as when Tailscale cannot be
+ * reached: that says nothing about the URL either way.
  */
-async function keepApproved(name: string, hostId: string | undefined, log: (message: string) => void): Promise<void> {
-  if (!hostId) return;
+async function checkApproval(name: string, hostId: string, restore: boolean): Promise<string | undefined> {
   try {
-    if (await ensureApproved(loadSecret(), name, hostId)) {
-      log(`Tailscale had withdrawn approval for "${name}". Restored it.`);
+    const secret = loadSecret();
+    const host = await findHost(secret, name, hostId);
+    if (!host) return `Tailscale no longer lists this machine as serving "${name}".`;
+    if (isApproved(host)) return 'ok';
+    if (!restore) return `Tailscale has withdrawn this machine's approval to serve "${name}".`;
+    try {
+      await approveHost(secret, name, hostId);
+      return 'restored';
+    } catch (err) {
+      if (err instanceof RoutletError && err.code === 'tailscale_unreachable') return undefined;
+      return `Tailscale has withdrawn this machine's approval to serve "${name}", and it could not be restored: ${
+        err instanceof Error ? err.message : err
+      }`;
     }
   } catch {
-    // A failed check is not worth interrupting anyone for; the next one will retry.
+    return undefined;
   }
 }
 
@@ -184,39 +198,55 @@ interface AttachOptions {
 }
 
 /** Bring up the URL for a name this machine has already claimed. */
-function attach(opts: AttachOptions): Promise<Ingress> {
-  const { name, log, signal } = opts;
-  if (opts.mode === 'local') return startLocalIngress(`127.0.0.1:${opts.localPort}`, log, signal);
+async function attach(opts: AttachOptions): Promise<Ingress> {
+  const { name, log } = opts;
+  if (opts.mode === 'local') return startLocalIngress(`127.0.0.1:${opts.localPort}`, log, opts.signal);
 
   const secret = loadSecret();
-  return startServiceIngress({
-    name,
-    onLog: log,
-    getAuthKey: () => mintAuthKey(secret, 'routlet gateway'),
-    signal,
-    approve: async (nodeId) => {
-      // A device must be approved to host a service. Tailnets with an
-      // autoApprovers rule do this themselves; otherwise approve it here.
-      // Tailscale takes a moment to list a host that has just advertised, and
-      // a slow network is worth a retry too.
-      for (let attempt = 0; ; attempt++) {
-        if (signal?.aborted) throw new RoutletError('Cancelled.', 'cancelled');
-        try {
-          await ensureApproved(secret, name, nodeId);
-          return;
-        } catch (err) {
-          const retryable =
-            err instanceof RoutletError && (err.code === 'service_failed' || err.code === 'tailscale_unreachable');
-          if (retryable && attempt < 40) {
+  // Cancels the approval wait when this attempt ends for any reason, not only
+  // when the service stops, so an abandoned attempt never keeps calling the API.
+  const attempt = new AbortController();
+  const cancel = () => attempt.abort();
+  opts.signal?.addEventListener('abort', cancel, { once: true });
+  if (opts.signal?.aborted) cancel();
+  const cancelled = () => new RoutletError('Cancelled.', 'cancelled');
+
+  try {
+    return await startServiceIngress({
+      name,
+      onLog: log,
+      getAuthKey: () => mintAuthKey(secret, 'routlet gateway'),
+      signal: attempt.signal,
+      approve: async (nodeId) => {
+        // A device must be approved to host a service. Tailnets with an
+        // autoApprovers rule do this themselves; otherwise approve it here.
+        for (let tries = 0; ; tries++) {
+          if (attempt.signal.aborted) throw cancelled();
+          try {
+            await ensureApproved(secret, name, nodeId);
+            return;
+          } catch (err) {
+            const code = err instanceof RoutletError ? err.code : '';
+            // Re-attaching: approval was granted at start and is watched
+            // separately, so not being able to confirm it must not delay the
+            // URL coming back after a purely local gateway restart.
+            if (!opts.mustApprove && code !== 'service_failed') return;
+            // Tailscale takes a moment to list a host that has just advertised,
+            // and a slow or busy API is worth another try.
+            const retryable = code === 'service_failed' || code === 'tailscale_unreachable';
+            if (!retryable || tries >= (opts.mustApprove ? 40 : 10)) {
+              if (opts.mustApprove) throw err;
+              return;
+            }
             await new Promise((r) => setTimeout(r, 500).unref());
-            continue;
           }
-          if (!opts.mustApprove) return;
-          throw err;
         }
-      }
-    },
-  });
+      },
+    });
+  } finally {
+    attempt.abort();
+    opts.signal?.removeEventListener('abort', cancel);
+  }
 }
 
 function resolveUrl(ref: string, name: string, ingress: Ingress, mode: IngressMode): string {
@@ -351,10 +381,27 @@ export async function run(opts: RunOptions): Promise<RunningService> {
       startedAt: new Date().toISOString(),
     });
 
+    // Watch approval for as long as the service runs. ROUTLET_REAPPROVE=0 turns
+    // off the automatic repair, for a tailnet whose admins un-approve hosts on
+    // purpose and want that to stick; the problem is still reported.
+    const restore = process.env.ROUTLET_REAPPROVE !== '0';
+    let lastProblem: string | undefined;
+    const watchApproval = async () => {
+      if (!live.hostId) return;
+      const result = await checkApproval(name, live.hostId, restore);
+      if (result === undefined) return;
+      const problem = result === 'ok' || result === 'restored' ? undefined : result;
+      if (result === 'restored') log(`Tailscale had withdrawn approval for "${name}". Restored it.`);
+      if (problem && problem !== lastProblem) log(`${problem}\nThe app is still running, but its URL is down.`);
+      if (!problem && lastProblem) log(`${name} is being served again.`);
+      if (Boolean(problem) !== Boolean(lock.unapproved)) {
+        lock.unapproved = Boolean(problem) || undefined;
+        updateLock(name, lock);
+      }
+      lastProblem = problem;
+    };
     const approvalCheck =
-      mode === 'tailscale'
-        ? setInterval(() => void keepApproved(name, live.hostId, log), APPROVAL_CHECK_MS)
-        : undefined;
+      mode === 'tailscale' ? setInterval(() => void watchApproval().catch(() => {}), APPROVAL_CHECK_MS) : undefined;
     approvalCheck?.unref();
 
     // Shutting down has two steps. Repairs stop at once, so a helper dying as
@@ -398,7 +445,7 @@ export async function run(opts: RunOptions): Promise<RunningService> {
 function withLock(record: ServiceRecord): { info: ServiceInfo; hostId?: string } {
   const lock = readLock(record.name);
   return {
-    info: { ...record, running: Boolean(lock), pid: lock?.childPid, urlOffline: lock?.offline || undefined },
+    info: { ...record, running: Boolean(lock), pid: lock?.childPid, urlOffline: lock?.offline || lock?.unapproved || undefined },
     hostId: lock?.hostId,
   };
 }

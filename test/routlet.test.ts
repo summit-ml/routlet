@@ -23,6 +23,11 @@ const fixture = path.resolve(import.meta.dirname, 'fixtures', 'server.mjs');
 const app = ['node', fixture];
 const started: Array<{ stop(): Promise<void> }> = [];
 
+/** Signal a helper started by this test run, and never anyone else's. */
+function signalHelper(signal: string, pattern: string): void {
+  spawnSync('pkill', [signal, '-P', String(process.pid), '-f', pattern]);
+}
+
 async function start(name: string, extra: Partial<Parameters<typeof routlet.run>[0]> = {}) {
   const service = await routlet.run({ name, command: app, ingress: 'local', stdio: 'ignore', ...extra });
   started.push(service);
@@ -190,7 +195,7 @@ test('the URL comes back by itself if its helper dies, and the app keeps running
   const service = await start('resilient', { onLog: (m) => logs.push(m) });
   assert.equal(service.url, url);
   const helper = `routlet-helper --mode local --listen ${new URL(url).host}`;
-  spawnSync('pkill', ['-9', '-f', helper]);
+  signalHelper('-9', helper);
 
   let status = 0;
   for (let i = 0; i < 100 && status !== 200; i++) {
@@ -204,7 +209,7 @@ test('the URL comes back by itself if its helper dies, and the app keeps running
   assert.equal(routlet.list().find((s) => s.name === 'resilient')?.pid, service.pid);
 });
 
-test('a URL that cannot be restored is reported, and stopping does not wait on the retries', async () => {
+test('a URL that cannot be restored is reported, and stopping does not wait on the retries', async (t) => {
   const first = await start('stuck');
   const url = first.url;
   await first.stop();
@@ -215,15 +220,16 @@ test('a URL that cannot be restored is reported, and stopping does not wait on t
   const helper = `routlet-helper --mode local --listen ${host}`;
 
   // Signals a terminal sends on the way out must not take the helper down.
-  spawnSync('pkill', ['-HUP', '-f', helper]);
-  spawnSync('pkill', ['-TERM', '-f', helper]);
+  signalHelper('-HUP', helper);
+  signalHelper('-TERM', helper);
   await new Promise((r) => setTimeout(r, 600));
   assert.equal((await fetch(url)).status, 200);
   assert.equal(logs.some((m) => m.includes('went offline')), false);
 
   // Kill it for real and take its port, so it cannot come back.
-  spawnSync('pkill', ['-9', '-f', helper]);
+  signalHelper('-9', helper);
   const blocker = net.createServer();
+  t.after(() => blocker.close());
   await new Promise<void>((resolve, reject) => {
     const tryListen = (attempt: number) => {
       blocker.once('error', (err) => (attempt < 50 ? setTimeout(() => tryListen(attempt + 1), 5) : reject(err)));
@@ -243,7 +249,6 @@ test('a URL that cannot be restored is reported, and stopping does not wait on t
   const started = Date.now();
   await service.stop();
   assert.ok(Date.now() - started < 3000, `stop took ${Date.now() - started}ms`);
-  blocker.close();
 });
 
 test('the URL stays up until the app has finished shutting down', async () => {
@@ -261,10 +266,19 @@ test('a helper that dies while a new app is still starting comes back on the sam
   const starting = start('early', { env: { SLOW_START: '2000' }, onLog: (m) => logs.push(m) });
   // The helper is up almost at once; the app is not listening for two seconds.
   await new Promise((r) => setTimeout(r, 700));
-  const before = spawnSync('pgrep', ['-f', 'routlet-helper --mode local --listen 127.0.0.1:0'], { encoding: 'utf8' });
-  const pids = before.stdout.trim().split('\n').filter(Boolean);
-  // The newest matching helper belongs to this service.
-  process.kill(Number(pids.at(-1)), 'SIGKILL');
+  // Helpers started by this test run that are still waiting for a port. Every
+  // earlier service is on a fixed port by now or has stopped, so the only one
+  // left listening on port 0 with no recorded service is this one's.
+  const known = new Set(routlet.list().map((s) => new URL(s.url).port));
+  const mine = spawnSync('pgrep', ['-P', String(process.pid), '-f', 'routlet-helper --mode local'], { encoding: 'utf8' })
+    .stdout.trim().split('\n').filter(Boolean).map(Number);
+  const target = mine.find((pid) => {
+    const ports = spawnSync('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-a', '-p', String(pid), '-Fn'], { encoding: 'utf8' }).stdout;
+    const port = ports.match(/:(\d+)\s*$/m)?.[1];
+    return port !== undefined && !known.has(port);
+  });
+  assert.ok(target, 'could not identify the starting service\'s helper');
+  process.kill(target, 'SIGKILL');
 
   const service = await starting;
   for (let i = 0; i < 50 && !logs.some((m) => m.includes('is back at')); i++) await new Promise((r) => setTimeout(r, 100));

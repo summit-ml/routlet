@@ -139,6 +139,7 @@ var serviceName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 type gateway struct {
 	srv    *tsnet.Server
 	lc     *local.Client
+	lock   *os.File
 	active atomic.Int32
 }
 
@@ -182,7 +183,7 @@ func serveGateway(dir, socket, hostname string) {
 	if secs, err := strconv.Atoi(os.Getenv("ROUTLET_GATEWAY_IDLE_SECONDS")); err == nil && secs > 0 {
 		idleExit = time.Duration(secs) * time.Second
 	}
-	g := &gateway{srv: srv, lc: lc}
+	g := &gateway{srv: srv, lc: lc, lock: lock}
 	go g.exitWhenIdle(socket)
 	for {
 		conn, err := ln.Accept()
@@ -202,7 +203,11 @@ func (g *gateway) exitWhenIdle(socket string) {
 			idleSince = time.Now()
 		} else if time.Since(idleSince) > idleExit {
 			log.Printf("idle, shutting down")
+			// Give up the socket and the lock first, so a service starting at
+			// this moment can bring up a fresh gateway instead of waiting on
+			// one that is leaving.
 			os.Remove(socket)
+			syscall.Flock(int(g.lock.Fd()), syscall.LOCK_UN)
 			g.srv.Close()
 			os.Exit(0)
 		}

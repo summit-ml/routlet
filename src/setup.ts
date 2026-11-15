@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { helperPath } from './ingress.ts';
+import { RoutletError } from './registry.ts';
 import { readSecret } from './secret-store.ts';
 import {
   defineService,
@@ -36,6 +37,8 @@ function tailscaleStatus(): Promise<any | undefined> {
 }
 
 const message = (err: unknown) => (err instanceof Error ? err.message : String(err));
+/** A check that could not be made because Tailscale could not be reached. */
+const unreachable = (err: unknown) => err instanceof RoutletError && err.code === 'tailscale_unreachable';
 
 /**
  * Check everything Routlet needs for tailnet URLs and say what to do about
@@ -96,6 +99,10 @@ export async function setup(): Promise<SetupCheck[]> {
     await listDevices(secret);
     add('Access to devices', 'ok', 'Can read devices');
   } catch (err) {
+    if (unreachable(err)) {
+      add('Access to Tailscale', 'unknown', message(err));
+      return checks;
+    }
     add('Access to devices', 'fail', message(err).includes('(403)') ? scopeFix('Devices: Core') : message(err));
   }
 
@@ -105,13 +112,11 @@ export async function setup(): Promise<SetupCheck[]> {
     add(`Auth keys for ${routletTag()}`, 'ok', 'Can create tagged auth keys');
   } catch (err) {
     const text = message(err);
-    add(
-      `Auth keys for ${routletTag()}`,
-      'fail',
+    const fix =
       /tag/i.test(text) && !text.includes('(403)')
         ? `Add "tagOwners": { "${routletTag()}": ["autogroup:admin"] } to the policy file at ${CONSOLE}/acls/file, and give the OAuth client that tag.`
-        : scopeFix('Auth Keys'),
-    );
+        : scopeFix('Auth Keys');
+    add(`Auth keys for ${routletTag()}`, unreachable(err) ? 'unknown' : 'fail', unreachable(err) ? text : fix);
   }
 
   try {
@@ -121,7 +126,8 @@ export async function setup(): Promise<SetupCheck[]> {
     add('Access to services', 'ok', 'Can define and delete services');
   } catch (err) {
     // Tailscale answers 404, not 403, when the client lacks the Services scope.
-    add('Access to services', 'fail', /\((403|404)\)/.test(message(err)) ? scopeFix('Services') : message(err));
+    const fix = /\((403|404)\)/.test(message(err)) ? scopeFix('Services') : message(err);
+    add('Access to services', unreachable(err) ? 'unknown' : 'fail', unreachable(err) ? message(err) : fix);
   }
 
   return checks;

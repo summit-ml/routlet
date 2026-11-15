@@ -60,6 +60,9 @@ async function request(secret: string, method: string, route: string, what: stri
     what,
   );
   if (res.status === 404 && method === 'GET') return undefined;
+  if (res.status === 429 || res.status >= 500) {
+    throw new RoutletError(`Tailscale is not answering right now (${res.status} while ${what}). Try again shortly.`, 'tailscale_unreachable');
+  }
   if (!res.ok) {
     const hint =
       // A missing scope is reported as 403, or as 404 for services.
@@ -84,6 +87,10 @@ async function accessToken(secret: string): Promise<string> {
     'signing in',
   );
   const json: any = parse(text) ?? {};
+  // Only a rejection is the secret's fault. Rate limits and server errors pass.
+  if (res.status === 429 || res.status >= 500) {
+    throw new RoutletError(`Tailscale is not answering right now (${res.status} while signing in). Try again shortly.`, 'tailscale_unreachable');
+  }
   if (!res.ok || !json.access_token) {
     throw new RoutletError(
       `Tailscale rejected the OAuth client secret (${res.status}). Save a valid one with "routlet auth".`,

@@ -42,6 +42,8 @@ export interface Lock {
   hostId?: string;
   /** True while the app is running but its URL is down and being restored. */
   offline?: boolean;
+  /** True while Tailscale is not letting this machine serve the name. */
+  unapproved?: boolean;
 }
 
 // A single DNS label, because the name becomes the hostname.

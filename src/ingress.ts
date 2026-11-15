@@ -143,12 +143,15 @@ export function startLocalIngress(listen: string, onLog: Log, signal?: AbortSign
   return negotiate({
     input: child.stdout,
     send: (message) => child.stdin.write(JSON.stringify(message) + '\n'),
-    // Closing stdin tells the helper to exit. It ignores ordinary signals so that
-    // a terminal closing does not take the URL down before the app has stopped,
-    // so the fallback for a stuck helper has to be SIGKILL.
+    // Closing stdin tells the helper to exit, after it has flushed what it was
+    // sending. It ignores ordinary signals so that a terminal closing does not
+    // take the URL down before the app has stopped, so the fallback for a helper
+    // that fails to exit has to be SIGKILL.
     close: () => {
       child.stdin.end();
-      child.kill('SIGKILL');
+      const timer = setTimeout(() => child.kill('SIGKILL'), 1000);
+      timer.unref();
+      child.once('close', () => clearTimeout(timer));
     },
     closed,
     closeDetail: () => stderr.join('\n'),
@@ -211,30 +214,41 @@ async function connectGateway(getAuthKey: () => Promise<string>, onLog: Log, sig
     onLog('Adding this machine\'s Routlet gateway to your tailnet (first time only).');
     env.TS_AUTHKEY = await getAuthKey();
   }
-  const log = fs.openSync(gatewayLog(), 'a');
-  const child = spawn(
-    helperPath(),
-    ['--mode', 'gateway', '--dir', gatewayDir(), '--socket', gatewaySocket(), '--hostname', gatewayHostname()],
-    { detached: true, stdio: ['ignore', log, log], env },
-  );
-  fs.closeSync(log);
-  // A gateway that exits cleanly lost the race to another one starting at the
-  // same moment, which is still coming up: keep waiting for its socket. One
-  // that exits with an error is not coming back.
-  let exitCode: number | null | undefined;
-  child.once('exit', (code) => (exitCode = code));
-  child.once('error', () => (exitCode = 1));
-  child.unref();
 
-  // Joining the tailnet takes a few seconds.
+  const spawnGateway = () => {
+    const log = fs.openSync(gatewayLog(), 'a');
+    const child = spawn(
+      helperPath(),
+      ['--mode', 'gateway', '--dir', gatewayDir(), '--socket', gatewaySocket(), '--hostname', gatewayHostname()],
+      { detached: true, stdio: ['ignore', log, log], env },
+    );
+    fs.closeSync(log);
+    const state: { code?: number | null; at?: number } = {};
+    const done = (code: number | null) => {
+      state.code = code;
+      state.at = Date.now();
+    };
+    child.once('exit', done);
+    child.once('error', () => done(1));
+    child.unref();
+    return state;
+  };
+
+  // Joining the tailnet takes a few seconds. Our gateway may also exit cleanly
+  // because another one holds the lock: one that is starting at the same moment,
+  // whose socket will appear shortly, or one that is on its way out, in which
+  // case ours has to be started again once it has gone.
   const deadline = Date.now() + 100_000;
-  let failedAt = 0;
+  let gateway = spawnGateway();
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new RoutletError('Cancelled.', 'cancelled');
     const socket = await connect();
     if (socket) return socket;
-    if (exitCode !== undefined && exitCode !== 0 && !failedAt) failedAt = Date.now();
-    if (failedAt && Date.now() - failedAt > 3000) break;
+    if (gateway.at !== undefined) {
+      const waited = Date.now() - gateway.at;
+      if (gateway.code !== 0 && waited > 3000) break;
+      if (gateway.code === 0 && waited > 6000) gateway = spawnGateway();
+    }
     await new Promise((r) => setTimeout(r, 250));
   }
   throw new RoutletError(

@@ -63,7 +63,21 @@ In the Tailscale admin console:
    ```
    and paste it at the prompt. It is stored in your system keychain.
 
-Run `routlet setup` to check all of this; it reports what is missing and where to fix it.
+5. **Recommended: stop tagged devices from starting connections.** A new tailnet's policy lets every
+   device reach every other one. Routlet's gateway only ever receives connections, so you can limit
+   who may start them to devices that belong to a person. In the policy file, change the default rule
+   ```json
+   {"src": ["*"], "dst": ["*"], "ip": ["*"]},
+   ```
+   to
+   ```json
+   {"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
+   ```
+   Then, if the secret were ever stolen, a device added with it could not reach your machines. This
+   applies to every tagged device on the tailnet, so skip it or adapt it if you have tagged servers
+   that need to connect out.
+
+Run `routlet setup` to check steps 1 to 4; it reports what is missing and where to fix it.
 
 The credential can only create and manage things carrying `tag:routlet`; it cannot touch
 your own devices, users, or policy.

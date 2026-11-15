@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 // Builds the per-platform helper packages into npm/<platform>-<arch>/.
 //
-// The main package lists these as optionalDependencies. Each one declares the
+// The published main package lists these as optionalDependencies. Each one declares the
 // operating system and CPU it is for, so npm installs only the one that matches
 // the machine. Go cross-compiles all of them from any host.
 //
 //   node scripts/build-packages.mjs            build every platform
 //   node scripts/build-packages.mjs --host     build only this machine's platform
+//   node scripts/build-packages.mjs --stamp    also add them to package.json, for publishing
 
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -25,13 +26,12 @@ const TARGETS = [
 
 const packageName = (t) => `${pkg.name}-${t.os}-${t.cpu}`;
 
-// The main package must depend on exactly the versions built here.
-const expected = Object.fromEntries(TARGETS.map((t) => [packageName(t), pkg.version]));
-if (JSON.stringify(pkg.optionalDependencies ?? {}) !== JSON.stringify(expected)) {
-  console.error('package.json optionalDependencies are out of date. They should be:');
-  console.error(JSON.stringify(expected, null, 2));
-  process.exit(1);
-}
+// The main package depends on exactly the versions built here. That list is
+// not kept in package.json in the repository: the platform packages for a new
+// version do not exist on npm until the release publishes them, and a lockfile
+// cannot stay in sync with dependencies that come and go. `--stamp` writes the
+// list into package.json just before publishing.
+const optionalDependencies = Object.fromEntries(TARGETS.map((t) => [packageName(t), pkg.version]));
 
 const hostOnly = process.argv.includes('--host');
 const targets = hostOnly ? TARGETS.filter((t) => t.os === process.platform && t.cpu === process.arch) : TARGETS;
@@ -81,4 +81,10 @@ for (const target of targets) {
 
   const size = (fs.statSync(path.join(dir, 'bin', 'routlet-helper')).size / 1e6).toFixed(1);
   console.log(`built ${packageName(target)}@${pkg.version} (${size} MB)`);
+}
+
+if (process.argv.includes('--stamp')) {
+  const file = path.join(root, 'package.json');
+  fs.writeFileSync(file, JSON.stringify({ ...pkg, optionalDependencies }, null, 2) + '\n');
+  console.log('stamped optionalDependencies into package.json (do not commit this change)');
 }

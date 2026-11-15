@@ -42,7 +42,8 @@ jobs:
       - run: npm run build
       - run: npm run build:helper
       - run: npm test
-      - run: npm run build:packages
+      # --stamp adds the platform packages to package.json as optionalDependencies.
+      - run: npm run build:packages -- --stamp
       # Platform packages first, so the main package's dependencies exist when it lands.
       - name: Publish platform packages
         run: |

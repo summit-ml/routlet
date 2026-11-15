@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Sets the release version everywhere it appears: the package version and each
-// platform package it depends on. They must always match, so change them together.
+// Sets the release version in package.json and the lockfile. The platform
+// packages take their version from here when they are built.
 //
 //   npm run set-version 0.2.0
 
@@ -18,11 +18,9 @@ const file = path.resolve(import.meta.dirname, '..', 'package.json');
 const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
 const previous = pkg.version;
 pkg.version = version;
-for (const name of Object.keys(pkg.optionalDependencies ?? {})) pkg.optionalDependencies[name] = version;
 fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
 
-// Keep the lockfile in step. Platform packages for a new version are not on
-// npm yet; npm skips optional dependencies it cannot find.
+// Keep the lockfile in step.
 execFileSync('npm', ['install', '--package-lock-only', '--ignore-scripts'], { cwd: path.dirname(file), stdio: 'ignore' });
 
 console.log(`${previous} -> ${version}`);

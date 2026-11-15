@@ -46,12 +46,6 @@
     "prepack": "npm run build",
     "set-version": "node scripts/set-version.mjs"
   },
-  "optionalDependencies": {
-    "@summitml/routlet-darwin-arm64": "0.1.0",
-    "@summitml/routlet-darwin-x64": "0.1.0",
-    "@summitml/routlet-linux-x64": "0.1.0",
-    "@summitml/routlet-linux-arm64": "0.1.0"
-  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"

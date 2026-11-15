@@ -216,7 +216,9 @@ Tests use the `local` ingress, so they need no Tailscale account. The gateway lo
 ### Releasing
 
 The helper binary ships as one small package per platform (`@summitml/routlet-darwin-arm64` and so
-on), listed as optional dependencies of the main package so npm installs only the matching one.
+on). The published main package lists them as optional dependencies, so npm installs only the
+matching one. That list is added at release time and is deliberately not in the repository's
+`package.json`.
 
 ```bash
 npm run build:packages     # cross-compile every platform's helper into npm/
@@ -225,7 +227,7 @@ npm run build:packages     # cross-compile every platform's helper into npm/
 To release a new version:
 
 ```bash
-npm run set-version 0.2.0      # updates the version everywhere it appears
+npm run set-version 0.2.0      # updates package.json and the lockfile
 git commit -am "Release 0.2.0" && git push
 git tag v0.2.0 && git push origin v0.2.0
 ```

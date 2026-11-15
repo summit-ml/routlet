@@ -1,6 +1,6 @@
 {
   "name": "@summitml/routlet",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Named dev services. Any port. Any network.",
   "license": "MIT",
   "repository": {

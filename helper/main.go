@@ -302,9 +302,10 @@ func main() {
 
 	switch *mode {
 	case "local":
-		// Ctrl-C reaches the whole terminal process group. The parent decides
-		// when the helper stops, so the URL stays up while the app shuts down.
-		signal.Ignore(os.Interrupt)
+		// Ctrl-C, a closing terminal, and a process-group kill all reach this
+		// process as well as the app. The parent decides when the helper stops,
+		// by closing stdin, so the URL stays up while the app shuts down.
+		signal.Ignore(os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
 		log.SetOutput(io.Discard)
 		serveLocal(*listen)
 	case "gateway":

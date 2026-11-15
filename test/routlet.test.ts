@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
@@ -201,6 +202,48 @@ test('the URL comes back by itself if its helper dies, and the app keeps running
   assert.ok(logs.some((m) => m.includes('is back at')));
   // Same app process throughout: it was never restarted.
   assert.equal(routlet.list().find((s) => s.name === 'resilient')?.pid, service.pid);
+});
+
+test('a URL that cannot be restored is reported, and stopping does not wait on the retries', async () => {
+  const first = await start('stuck');
+  const url = first.url;
+  await first.stop();
+
+  const logs: string[] = [];
+  const service = await start('stuck', { onLog: (m) => logs.push(m) });
+  const { host, port } = new URL(url);
+  const helper = `routlet-helper --mode local --listen ${host}`;
+
+  // Signals a terminal sends on the way out must not take the helper down.
+  spawnSync('pkill', ['-HUP', '-f', helper]);
+  spawnSync('pkill', ['-TERM', '-f', helper]);
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal((await fetch(url)).status, 200);
+  assert.equal(logs.some((m) => m.includes('went offline')), false);
+
+  // Kill it for real and take its port, so it cannot come back.
+  spawnSync('pkill', ['-9', '-f', helper]);
+  const blocker = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    const tryListen = (attempt: number) => {
+      blocker.once('error', (err) => (attempt < 50 ? setTimeout(() => tryListen(attempt + 1), 5) : reject(err)));
+      blocker.listen(Number(port), '127.0.0.1', () => resolve());
+    };
+    tryListen(0);
+  });
+
+  for (let i = 0; i < 60 && !logs.some((m) => m.includes('Cannot restore')); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(logs.some((m) => m.includes('Cannot restore')), logs.join(' | '));
+  const info = routlet.list().find((s) => s.name === 'stuck');
+  assert.equal(info?.running, true);
+  assert.equal(info?.urlOffline, true);
+
+  const started = Date.now();
+  await service.stop();
+  assert.ok(Date.now() - started < 3000, `stop took ${Date.now() - started}ms`);
+  blocker.close();
 });
 
 test('the CLI runs a service that another process can list, stop, and remove', async () => {

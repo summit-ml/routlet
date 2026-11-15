@@ -44,7 +44,8 @@
     "build:packages": "node scripts/build-packages.mjs",
     "test": "node --test test/*.test.ts",
     "prepack": "npm run build",
-    "set-version": "node scripts/set-version.mjs"
+    "set-version": "node scripts/set-version.mjs",
+    "prepublishOnly": "node scripts/check-publishable.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

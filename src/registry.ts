@@ -38,6 +38,10 @@ export interface Lock {
   childPid?: number;
   /** True when the owner is `routlet run`, which is safe to signal directly. */
   cli?: boolean;
+  /** Tailnet services: the gateway device hosting the name. */
+  hostId?: string;
+  /** True while the app is running but its URL is down and being restored. */
+  offline?: boolean;
 }
 
 // A single DNS label, because the name becomes the hostname.

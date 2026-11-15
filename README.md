@@ -196,8 +196,9 @@ with a `code` such as `already_running`, `name_owned`, `name_conflict`, or `app_
   `routlet rm`.
 - **The URL heals itself.** If the gateway crashes or is restarted, or Tailscale withdraws the
   gateway's approval to serve a name, Routlet restores the URL behind the running app within
-  seconds to a couple of minutes. Your dev server is not stopped. `routlet inspect <name>` shows
-  whether a running service is currently approved.
+  seconds to a couple of minutes. Your dev server is not stopped. If the URL cannot be restored,
+  Routlet keeps trying and says so, and `routlet list` shows the service as "running, URL offline".
+  `routlet inspect <name>` shows whether this machine is currently approved to serve the name.
 - **Everyone your tailnet policy allows can reach a service.** With the default allow-all policy that
   is every device on the tailnet.
 - **One name, one port.** `routlet run` wraps a single server. In a monorepo where one command starts

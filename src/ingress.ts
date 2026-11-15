@@ -12,6 +12,8 @@ import { RoutletError } from './registry.ts';
 export interface Ingress {
   url: string;
   hostname: string;
+  /** Tailnet services only: the ID of the gateway device hosting the name. */
+  hostId?: string;
   /** Point the URL at the app. Until this is called, requests get a 503. */
   setTarget(port: number): void;
   /** Take the URL offline. */
@@ -54,6 +56,8 @@ interface Channel {
   onAdvertised?(event: { fqdn: string; nodeId: string }): Promise<void>;
   onLog: Log;
   timeoutMs: number;
+  /** Abandons the negotiation, for example because the service is stopping. */
+  signal?: AbortSignal;
 }
 
 /** Drive the helper protocol until the URL is ready. */
@@ -71,6 +75,9 @@ function negotiate(channel: Channel): Promise<Ingress> {
       () => fail(new RoutletError('Timed out waiting for the URL to come up.', 'ingress_timeout')),
       channel.timeoutMs,
     );
+    channel.signal?.addEventListener('abort', () => fail(new RoutletError('Cancelled.', 'cancelled')), { once: true });
+    if (channel.signal?.aborted) fail(new RoutletError('Cancelled.', 'cancelled'));
+    let hostId: string | undefined;
     void channel.closed.then(() =>
       fail(new RoutletError(`The connection to the helper closed early. ${channel.closeDetail()}`.trim(), 'ingress_failed')),
     );
@@ -90,6 +97,7 @@ function negotiate(channel: Channel): Promise<Ingress> {
           fail(new RoutletError(event.message, event.code ?? 'ingress_failed'));
           break;
         case 'advertised':
+          hostId = event.nodeId || undefined;
           Promise.resolve(channel.onAdvertised?.(event)).then(
             () => channel.send({ prefetch: true }),
             (err) => fail(err),
@@ -102,6 +110,7 @@ function negotiate(channel: Channel): Promise<Ingress> {
           resolve({
             url: event.url,
             hostname: event.hostname,
+            hostId,
             setTarget: (port) => channel.send({ target: `localhost:${port}` }),
             stop: channel.close,
             exited: channel.closed,
@@ -113,7 +122,7 @@ function negotiate(channel: Channel): Promise<Ingress> {
 }
 
 /** A fixed http://127.0.0.1:<port> address, served by a helper process owned by this run. */
-export function startLocalIngress(listen: string, onLog: Log): Promise<Ingress> {
+export function startLocalIngress(listen: string, onLog: Log, signal?: AbortSignal): Promise<Ingress> {
   const child = spawn(helperPath(), ['--mode', 'local', '--listen', listen], { stdio: ['pipe', 'pipe', 'pipe'] });
   const stderr: string[] = [];
   readline.createInterface({ input: child.stderr }).on('line', (line) => {
@@ -127,15 +136,18 @@ export function startLocalIngress(listen: string, onLog: Log): Promise<Ingress> 
   return negotiate({
     input: child.stdout,
     send: (message) => child.stdin.write(JSON.stringify(message) + '\n'),
-    // Closing stdin tells the helper to exit; the kill covers a helper that is stuck.
+    // Closing stdin tells the helper to exit. It ignores ordinary signals so that
+    // a terminal closing does not take the URL down before the app has stopped,
+    // so the fallback for a stuck helper has to be SIGKILL.
     close: () => {
       child.stdin.end();
-      child.kill('SIGTERM');
+      child.kill('SIGKILL');
     },
     closed,
     closeDetail: () => stderr.join('\n'),
     onLog,
     timeoutMs: 15_000,
+    signal,
   });
 }
 
@@ -181,7 +193,7 @@ function logTail(): string {
  * gateway is a background process shared by every service; it exits on its own
  * after a period with nothing registered.
  */
-async function connectGateway(getAuthKey: () => Promise<string>, onLog: Log): Promise<net.Socket> {
+async function connectGateway(getAuthKey: () => Promise<string>, onLog: Log, signal?: AbortSignal): Promise<net.Socket> {
   const existing = await connect();
   if (existing) return existing;
 
@@ -209,6 +221,7 @@ async function connectGateway(getAuthKey: () => Promise<string>, onLog: Log): Pr
   const deadline = Date.now() + 100_000;
   let exitedAt = 0;
   while (Date.now() < deadline) {
+    if (signal?.aborted) throw new RoutletError('Cancelled.', 'cancelled');
     const socket = await connect();
     if (socket) return socket;
     if (exited && !exitedAt) exitedAt = Date.now();
@@ -228,11 +241,12 @@ export interface ServiceIngressOptions {
   /** Makes sure the gateway device is approved to host the service. */
   approve: (nodeId: string) => Promise<void>;
   onLog: Log;
+  signal?: AbortSignal;
 }
 
 /** An https://<name>.<tailnet>.ts.net address, hosted as a Tailscale Service by the gateway. */
 export async function startServiceIngress(opts: ServiceIngressOptions): Promise<Ingress> {
-  const socket = await connectGateway(opts.getAuthKey, opts.onLog);
+  const socket = await connectGateway(opts.getAuthKey, opts.onLog, opts.signal);
   const closed = new Promise<void>((resolve) => {
     socket.once('close', () => resolve());
     socket.once('error', () => resolve());
@@ -251,5 +265,118 @@ export async function startServiceIngress(opts: ServiceIngressOptions): Promise<
     onAdvertised: (event) => opts.approve(event.nodeId),
     onLog: opts.onLog,
     timeoutMs: 240_000,
+    signal: opts.signal,
   });
+}
+
+// ---- staying up ----
+
+export interface KeepAliveOptions {
+  name: string;
+  /** The ingress that is up now. */
+  first: Ingress;
+  /** Opens a replacement. Must give up promptly when the signal aborts. */
+  open: (signal: AbortSignal) => Promise<Ingress>;
+  onLog: Log;
+  /** Told when the URL goes offline and when it comes back. */
+  onState?: (online: boolean) => void;
+}
+
+/** How long a replacement must stay up before it counts as a success. */
+const STABLE_MS = 30_000;
+/** A pause before reacting, so an ingress dying as part of a shutdown is not "repaired". */
+const GRACE_MS = 300;
+const MAX_BACKOFF_MS = 30_000;
+const REMIND_EVERY_MS = 5 * 60_000;
+
+/**
+ * Wrap an ingress so that it is reopened whenever it goes away for a reason
+ * other than stop(): the gateway crashing or being restarted, for instance. The
+ * app behind it is left running throughout. Retries back off, an ingress that
+ * keeps dying straight after coming up is treated as failing, and a prolonged
+ * outage is reported periodically instead of once.
+ */
+export function keepAlive(opts: KeepAliveOptions): Ingress {
+  const { name, onLog } = opts;
+  const abort = new AbortController();
+  let current = opts.first;
+  let target: number | undefined;
+  let stopped = false;
+  let failures = 0;
+  let wake: (() => void) | undefined;
+  let resolveExited!: () => void;
+  const exited = new Promise<void>((resolve) => (resolveExited = resolve));
+
+  // A sleep that stop() can cut short and that never keeps the process alive.
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref();
+      wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    });
+
+  const watch = (ingress: Ingress, since: number) => {
+    void ingress.exited.then(async () => {
+      if (stopped) return;
+      if (Date.now() - since >= STABLE_MS) failures = 0;
+      await sleep(GRACE_MS);
+      if (stopped) return;
+
+      opts.onState?.(false);
+      onLog(`The URL for "${name}" went offline. Reconnecting; the app keeps running.`);
+      let lastReminder = 0;
+      while (!stopped) {
+        if (failures > 0) await sleep(Math.min(MAX_BACKOFF_MS, 500 * 2 ** failures));
+        if (stopped) return;
+        try {
+          const next = await opts.open(abort.signal);
+          if (stopped) return next.stop();
+          if (target !== undefined) next.setTarget(target);
+          current = next;
+          // Provisional: cleared only if this one stays up for STABLE_MS.
+          failures++;
+          opts.onState?.(true);
+          onLog(`${name} is back at ${next.url}`);
+          return watch(next, Date.now());
+        } catch (err) {
+          if (stopped) return;
+          failures++;
+          if (Date.now() - lastReminder >= REMIND_EVERY_MS) {
+            lastReminder = Date.now();
+            const why = err instanceof Error ? err.message : String(err);
+            onLog(`Cannot restore the URL for "${name}" yet: ${why}\nThe app is still running. Routlet will keep trying.`);
+          }
+        }
+      }
+    });
+  };
+  watch(current, Date.now());
+
+  return {
+    get url() {
+      return current.url;
+    },
+    get hostname() {
+      return current.hostname;
+    },
+    get hostId() {
+      return current.hostId;
+    },
+    setTarget(port) {
+      target = port;
+      current.setTarget(port);
+    },
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      abort.abort();
+      wake?.();
+      current.stop();
+      resolveExited();
+    },
+    exited,
+  };
 }

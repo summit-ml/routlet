@@ -129,7 +129,8 @@ function cmdList(argv: string[]): number {
     say('no services yet');
     return 0;
   }
-  const rows = services.map((s) => [s.name, s.running ? 'running' : 'stopped', s.url, s.running ? String(s.port ?? '') : '']);
+  const status = (s: (typeof services)[number]) => (!s.running ? 'stopped' : s.urlOffline ? 'running, URL offline' : 'running');
+  const rows = services.map((s) => [s.name, status(s), s.url, s.running ? String(s.port ?? '') : '']);
   const header = ['NAME', 'STATUS', 'URL', 'PORT'];
   const widths = header.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
   for (const row of [header, ...rows]) {
@@ -150,7 +151,16 @@ async function cmdInspect(argv: string[]): Promise<number> {
   const lines: Array<[string, string]> = [
     ['name', details.name],
     ['url', details.url],
-    ['status', details.running ? (details.healthy ? 'running' : 'running, not responding') : 'stopped'],
+    [
+      'status',
+      !details.running
+        ? 'stopped'
+        : details.urlOffline
+          ? 'running, but the URL is offline and being restored'
+          : details.healthy
+            ? 'running'
+            : 'running, not responding',
+    ],
     ['ingress', details.ingress],
     ['tailnet', details.approved === undefined ? '' : details.approved ? 'approved to serve' : 'NOT approved to serve (URL is down)'],
     ['app port', details.running ? String(details.port ?? '') : ''],

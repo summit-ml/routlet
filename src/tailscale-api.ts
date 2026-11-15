@@ -2,6 +2,8 @@ import { RoutletError } from './registry.ts';
 import { readSecret } from './secret-store.ts';
 
 const API = 'https://api.tailscale.com/api/v2';
+/** No Tailscale API call should hang a command on a dead network. */
+const REQUEST_TIMEOUT_MS = 15_000;
 
 /** Tag carried by Routlet's gateway device and by every service it defines. */
 export function routletTag(): string {
@@ -33,6 +35,7 @@ async function request(secret: string, method: string, route: string, what: stri
     method,
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (res.status === 404 && method === 'GET') return undefined;
   if (!res.ok) {
@@ -57,6 +60,7 @@ async function accessToken(secret: string): Promise<string> {
   const res = await fetch(`${API}/oauth/token`, {
     method: 'POST',
     body: new URLSearchParams({ client_id: clientId, client_secret: secret }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   const json: any = await res.json().catch(() => ({}));
   if (!res.ok || !json.access_token) {
@@ -128,6 +132,9 @@ export interface ServiceHost {
   /** 'not-approved', 'approved:manual', or 'approved:auto'. */
   approvalLevel: string;
 }
+
+/** True if Tailscale lets this host serve the service. */
+export const isApproved = (host: ServiceHost): boolean => host.approvalLevel.startsWith('approved');
 
 /** Devices currently offering to host the service. */
 export async function serviceHosts(secret: string, name: string): Promise<ServiceHost[]> {

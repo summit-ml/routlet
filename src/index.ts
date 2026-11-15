@@ -2,7 +2,7 @@ import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process'
 import os from 'node:os';
 import path from 'node:path';
 import { adaptCommand } from './adapt.ts';
-import { startLocalIngress, startServiceIngress, type Ingress } from './ingress.ts';
+import { keepAlive, startLocalIngress, startServiceIngress, type Ingress } from './ingress.ts';
 import { freePort, isListening, terminateTree, waitForPort } from './ports.ts';
 import {
   acquireLock,
@@ -16,6 +16,7 @@ import {
   validateName,
   writeRecord,
   type IngressMode,
+  type Lock,
   type ServiceRecord,
 } from './registry.ts';
 import {
@@ -25,6 +26,7 @@ import {
   findDevices,
   getService,
   hasSecret,
+  isApproved,
   loadSecret,
   mintAuthKey,
   routletTag,
@@ -85,6 +87,8 @@ export interface RunningService {
 export interface ServiceInfo extends ServiceRecord {
   running: boolean;
   pid?: number;
+  /** True while the app is running but its URL is down and being restored. */
+  urlOffline?: boolean;
 }
 
 export interface ServiceDetails extends ServiceInfo {
@@ -92,7 +96,8 @@ export interface ServiceDetails extends ServiceInfo {
   healthy: boolean;
   /**
    * For a running tailnet service: whether Tailscale currently lets this
-   * machine serve it. Undefined when that could not be checked.
+   * machine's gateway serve it. Undefined when that is not known: the check
+   * failed, or the gateway is not hosting the name at the moment.
    */
   approved?: boolean;
 }
@@ -102,16 +107,28 @@ const active = new Map<string, RunningService>();
 const APPROVAL_CHECK_MS = 120_000;
 
 /**
- * Restore the gateway's approval to host a running service if it has been
- * withdrawn, for example by a policy change. Without this the URL would stay
- * dead, silently, until the service was next restarted.
+ * Make sure this machine's gateway is approved to host a service, approving it
+ * through the API if it is not. Only ever touches the given host: another
+ * machine's approval is that machine's, or an admin's, business.
+ * Returns true if it had to approve.
  */
-async function keepApproved(name: string, log: (message: string) => void): Promise<void> {
+async function ensureApproved(secret: string, name: string, hostId: string): Promise<boolean> {
+  const host = (await serviceHosts(secret, name)).find((h) => h.nodeId === hostId);
+  if (!host) throw new RoutletError(`Tailscale does not list this machine as a host for "${name}".`, 'service_failed');
+  if (isApproved(host)) return false;
+  await approveHost(secret, name, hostId);
+  return true;
+}
+
+/**
+ * Restore approval for a running service if it has been withdrawn, for example
+ * by a policy change. Without this the URL would stay dead, silently, until the
+ * service was next restarted.
+ */
+async function keepApproved(name: string, hostId: string | undefined, log: (message: string) => void): Promise<void> {
+  if (!hostId) return;
   try {
-    const secret = loadSecret();
-    for (const host of await serviceHosts(secret, name)) {
-      if (host.approvalLevel.startsWith('approved')) continue;
-      await approveHost(secret, name, host.nodeId);
+    if (await ensureApproved(loadSecret(), name, hostId)) {
       log(`Tailscale had withdrawn approval for "${name}". Restored it.`);
     }
   } catch {
@@ -125,10 +142,11 @@ async function openIngress(
   prev: ServiceRecord | undefined,
   replace: boolean,
   log: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<Ingress> {
   if (mode === 'local') {
     const port = prev?.ingress === 'local' ? (prev.localPort ?? 0) : 0;
-    return startLocalIngress(`127.0.0.1:${port}`, log);
+    return startLocalIngress(`127.0.0.1:${port}`, log, signal);
   }
 
   const secret = loadSecret();
@@ -155,16 +173,20 @@ async function openIngress(
     name,
     onLog: log,
     getAuthKey: () => mintAuthKey(secret, 'routlet gateway'),
+    signal,
     approve: async (nodeId) => {
       // A device must be approved to host a service. Tailnets with an
       // autoApprovers rule do this themselves; otherwise approve it here.
-      for (let attempt = 0; attempt < 40; attempt++) {
-        const host = (await serviceHosts(secret, name)).find((h) => h.nodeId === nodeId);
-        if (host?.approvalLevel.startsWith('approved')) return;
-        if (host) return approveHost(secret, name, nodeId);
-        await new Promise((r) => setTimeout(r, 500));
+      // Tailscale takes a moment to list a host that has just advertised.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await ensureApproved(secret, name, nodeId);
+          return;
+        } catch (err) {
+          if (attempt >= 40 || !(err instanceof RoutletError) || err.code !== 'service_failed') throw err;
+          await new Promise((r) => setTimeout(r, 500));
+        }
       }
-      throw new RoutletError(`Tailscale never listed this machine as a host for "${name}".`, 'service_failed');
     },
   });
 }
@@ -210,12 +232,28 @@ export async function run(opts: RunOptions): Promise<RunningService> {
     if (!opts.replace) throw new RoutletError(`"${name}" is already running.`, 'already_running');
     await stop(name);
   }
-  acquireLock(name, { pid: process.pid, cli: opts.cli });
+  const lock: Lock = { pid: process.pid, cli: opts.cli };
+  acquireLock(name, lock);
 
   let ingress: Ingress | undefined;
   let child: ChildProcess | undefined;
   try {
-    ingress = await openIngress(name, mode, prev, Boolean(opts.replace), log);
+    // The URL can go away while the app is healthy: the gateway may crash or be
+    // restarted. That is no reason to stop someone's dev server, so the ingress
+    // is wrapped to bring the URL back behind the running app.
+    const live = keepAlive({
+      name,
+      first: await openIngress(name, mode, prev, Boolean(opts.replace), log),
+      open: (signal) => openIngress(name, mode, readRecord(name), true, log, signal),
+      onLog: log,
+      onState: (online) => {
+        lock.offline = !online;
+        lock.hostId = live.hostId;
+        updateLock(name, lock);
+      },
+    });
+    ingress = live;
+    lock.hostId = live.hostId;
     const port = opts.port ?? (await freePort());
 
     const env: NodeJS.ProcessEnv = {
@@ -247,7 +285,8 @@ export async function run(opts: RunOptions): Promise<RunningService> {
       );
     });
     const pid = proc.pid!;
-    updateLock(name, { pid: process.pid, childPid: pid, cli: opts.cli });
+    lock.childPid = pid;
+    updateLock(name, lock);
 
     const abort = exitCode.then((code): never => {
       throw new RoutletError(`The app exited before it started listening (exit code ${code}).`, 'app_exited');
@@ -273,41 +312,20 @@ export async function run(opts: RunOptions): Promise<RunningService> {
       startedAt: new Date().toISOString(),
     });
 
-    const live = ingress;
-    // The URL can go away while the app is healthy: the gateway may crash or be
-    // restarted, or an admin may withdraw the host's approval. Neither is a
-    // reason to stop someone's dev server, so bring the URL back behind it.
-    let current = live;
-    let stopping = false;
-    const watch = (ing: Ingress) => {
-      void ing.exited.then(async () => {
-        if (stopping) return;
-        log(`The URL for "${name}" went offline. Reconnecting; the app keeps running.`);
-        for (let attempt = 0; !stopping; attempt++) {
-          try {
-            const next = await openIngress(name, mode, readRecord(name), true, log);
-            if (stopping) return next.stop();
-            next.setTarget(actualPort);
-            current = next;
-            log(`${name} is back at ${next.url}`);
-            return watch(next);
-          } catch (err) {
-            if (attempt === 0) log(`Could not reconnect yet (${err instanceof Error ? err.message : err}). Still trying.`);
-            await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
-          }
-        }
-      });
-    };
-    watch(live);
-
     const approvalCheck =
-      mode === 'tailscale' ? setInterval(() => void keepApproved(name, log), APPROVAL_CHECK_MS) : undefined;
+      mode === 'tailscale'
+        ? setInterval(() => void keepApproved(name, live.hostId, log), APPROVAL_CHECK_MS)
+        : undefined;
     approvalCheck?.unref();
 
-    const exited = exitCode.then((code) => {
-      stopping = true;
+    // Everything that should stop the URL being repaired goes through here, so a
+    // helper dying as part of a shutdown is never mistaken for an outage.
+    const shutDown = () => {
       clearInterval(approvalCheck);
-      current.stop();
+      live.stop();
+    };
+    const exited = exitCode.then((code) => {
+      shutDown();
       active.delete(name);
       releaseLock(name);
       return code;
@@ -321,6 +339,7 @@ export async function run(opts: RunOptions): Promise<RunningService> {
       child: proc,
       exited,
       stop: async () => {
+        shutDown();
         await terminateTree(pid);
         await exited;
       },
@@ -337,7 +356,7 @@ export async function run(opts: RunOptions): Promise<RunningService> {
 
 function toInfo(record: ServiceRecord): ServiceInfo {
   const lock = readLock(record.name);
-  return { ...record, running: Boolean(lock), pid: lock?.childPid };
+  return { ...record, running: Boolean(lock), pid: lock?.childPid, urlOffline: lock?.offline || undefined };
 }
 
 /** Every known service, running or not. */
@@ -345,21 +364,30 @@ export function list(): ServiceInfo[] {
   return listRecords().map(toInfo);
 }
 
+async function approvalOf(name: string, hostId: string): Promise<boolean | undefined> {
+  const check = (async () => {
+    const host = (await serviceHosts(loadSecret(), name)).find((h) => h.nodeId === hostId);
+    return host ? isApproved(host) : undefined;
+  })().catch(() => undefined);
+  const timeout = new Promise<undefined>((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), 4000);
+    timer.unref();
+  });
+  return Promise.race([check, timeout]);
+}
+
 /** Details for one service, or undefined if the name has never been used. */
 export async function inspect(name: string): Promise<ServiceDetails | undefined> {
   const record = readRecord(validateName(name));
   if (!record) return undefined;
   const info = toInfo(record);
-  const healthy = info.running && record.port !== undefined && (await isListening(record.port));
-  let approved: boolean | undefined;
-  if (info.running && record.ingress === 'tailscale') {
-    try {
-      const hosts = await serviceHosts(loadSecret(), record.name);
-      approved = hosts.some((h) => h.approvalLevel.startsWith('approved'));
-    } catch {
-      // leave undefined
-    }
-  }
+  const hostId = readLock(record.name)?.hostId;
+  // Both checks at once, and the network one is bounded, so a dead connection
+  // cannot hold up what is otherwise a local status command.
+  const [healthy, approved] = await Promise.all([
+    info.running && record.port !== undefined ? isListening(record.port) : false,
+    info.running && record.ingress === 'tailscale' && hostId ? approvalOf(record.name, hostId) : undefined,
+  ]);
   return { ...info, healthy, approved };
 }
 

@@ -47,9 +47,9 @@ jobs:
       # Platform packages first, so the main package's dependencies exist when it
       # lands. Anything already on npm at this version is skipped, so a run that
       # failed partway can simply be re-run.
-      - name: Publish platform packages
+      - name: Publish
         run: |
-          for dir in npm/*/; do
+          for dir in npm/*/ ./; do
             name="$(node -p "require('./${dir}package.json').name")"
             version="$(node -p "require('./${dir}package.json').version")"
             if npm view "$name@$version" version >/dev/null 2>&1; then
@@ -58,12 +58,3 @@ jobs:
               npm publish "./$dir" --access public
             fi
           done
-      - name: Publish main package
-        run: |
-          name="$(node -p "require('./package.json').name")"
-          version="$(node -p "require('./package.json').version")"
-          if npm view "$name@$version" version >/dev/null 2>&1; then
-            echo "$name@$version is already published, skipping"
-          else
-            npm publish --access public
-          fi

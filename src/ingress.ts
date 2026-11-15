@@ -64,10 +64,15 @@ interface Channel {
 function negotiate(channel: Channel): Promise<Ingress> {
   return new Promise<Ingress>((resolve, reject) => {
     let settled = false;
-    const fail = (err: Error) => {
-      if (settled) return;
+    // The signal can outlive many negotiations, so never leave a listener on it.
+    const settle = () => {
       settled = true;
       clearTimeout(timer);
+      channel.signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settle();
       channel.close();
       reject(err);
     };
@@ -75,8 +80,11 @@ function negotiate(channel: Channel): Promise<Ingress> {
       () => fail(new RoutletError('Timed out waiting for the URL to come up.', 'ingress_timeout')),
       channel.timeoutMs,
     );
-    channel.signal?.addEventListener('abort', () => fail(new RoutletError('Cancelled.', 'cancelled')), { once: true });
-    if (channel.signal?.aborted) fail(new RoutletError('Cancelled.', 'cancelled'));
+    function onAbort() {
+      fail(new RoutletError('Cancelled.', 'cancelled'));
+    }
+    channel.signal?.addEventListener('abort', onAbort, { once: true });
+    if (channel.signal?.aborted) onAbort();
     let hostId: string | undefined;
     void channel.closed.then(() =>
       fail(new RoutletError(`The connection to the helper closed early. ${channel.closeDetail()}`.trim(), 'ingress_failed')),
@@ -105,8 +113,7 @@ function negotiate(channel: Channel): Promise<Ingress> {
           break;
         case 'ready':
           if (settled) return;
-          settled = true;
-          clearTimeout(timer);
+          settle();
           resolve({
             url: event.url,
             hostname: event.hostname,
@@ -211,21 +218,23 @@ async function connectGateway(getAuthKey: () => Promise<string>, onLog: Log, sig
     { detached: true, stdio: ['ignore', log, log], env },
   );
   fs.closeSync(log);
-  let exited = false;
-  child.once('exit', () => (exited = true));
-  child.once('error', () => (exited = true));
+  // A gateway that exits cleanly lost the race to another one starting at the
+  // same moment, which is still coming up: keep waiting for its socket. One
+  // that exits with an error is not coming back.
+  let exitCode: number | null | undefined;
+  child.once('exit', (code) => (exitCode = code));
+  child.once('error', () => (exitCode = 1));
   child.unref();
 
-  // Joining the tailnet takes a few seconds. If another run started a gateway at
-  // the same moment, ours exits and we connect to theirs.
+  // Joining the tailnet takes a few seconds.
   const deadline = Date.now() + 100_000;
-  let exitedAt = 0;
+  let failedAt = 0;
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new RoutletError('Cancelled.', 'cancelled');
     const socket = await connect();
     if (socket) return socket;
-    if (exited && !exitedAt) exitedAt = Date.now();
-    if (exitedAt && Date.now() - exitedAt > 3000) break;
+    if (exitCode !== undefined && exitCode !== 0 && !failedAt) failedAt = Date.now();
+    if (failedAt && Date.now() - failedAt > 3000) break;
     await new Promise((r) => setTimeout(r, 250));
   }
   throw new RoutletError(
@@ -296,12 +305,28 @@ const REMIND_EVERY_MS = 5 * 60_000;
  * keeps dying straight after coming up is treated as failing, and a prolonged
  * outage is reported periodically instead of once.
  */
-export function keepAlive(opts: KeepAliveOptions): Ingress {
-  const { name, onLog } = opts;
+export function keepAlive(opts: KeepAliveOptions): Ingress & { quiesce(): void } {
+  const { name } = opts;
+  // The caller's callbacks must never be able to break the repair loop.
+  const onLog: Log = (message) => {
+    try {
+      opts.onLog(message);
+    } catch {
+      // ignore
+    }
+  };
+  const onState = (online: boolean) => {
+    try {
+      opts.onState?.(online);
+    } catch {
+      // ignore
+    }
+  };
   const abort = new AbortController();
   let current = opts.first;
   let target: number | undefined;
   let stopped = false;
+  let closed = false;
   let failures = 0;
   let wake: (() => void) | undefined;
   let resolveExited!: () => void;
@@ -325,7 +350,7 @@ export function keepAlive(opts: KeepAliveOptions): Ingress {
       await sleep(GRACE_MS);
       if (stopped) return;
 
-      opts.onState?.(false);
+      onState(false);
       onLog(`The URL for "${name}" went offline. Reconnecting; the app keeps running.`);
       let lastReminder = 0;
       while (!stopped) {
@@ -338,7 +363,7 @@ export function keepAlive(opts: KeepAliveOptions): Ingress {
           current = next;
           // Provisional: cleared only if this one stays up for STABLE_MS.
           failures++;
-          opts.onState?.(true);
+          onState(true);
           onLog(`${name} is back at ${next.url}`);
           return watch(next, Date.now());
         } catch (err) {
@@ -369,11 +394,17 @@ export function keepAlive(opts: KeepAliveOptions): Ingress {
       target = port;
       current.setTarget(port);
     },
-    stop() {
+    /** Stop repairing, but leave the current ingress up. Used while the app shuts down. */
+    quiesce() {
       if (stopped) return;
       stopped = true;
       abort.abort();
       wake?.();
+    },
+    stop() {
+      this.quiesce();
+      if (closed) return;
+      closed = true;
       current.stop();
       resolveExited();
     },

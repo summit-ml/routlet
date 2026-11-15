@@ -246,6 +246,34 @@ test('a URL that cannot be restored is reported, and stopping does not wait on t
   blocker.close();
 });
 
+test('the URL stays up until the app has finished shutting down', async () => {
+  const service = await start('graceful', { env: { SLOW_EXIT: '1200' } });
+  const stopping = service.stop();
+  await new Promise((r) => setTimeout(r, 400));
+  // Still answering while the app is on its way out.
+  assert.equal(await fetch(service.url).then((r) => r.status, () => 0), 200);
+  await stopping;
+  assert.equal(await fetch(service.url).then((r) => r.status, () => 0), 0);
+});
+
+test('a helper that dies while a new app is still starting comes back on the same port', async () => {
+  const logs: string[] = [];
+  const starting = start('early', { env: { SLOW_START: '2000' }, onLog: (m) => logs.push(m) });
+  // The helper is up almost at once; the app is not listening for two seconds.
+  await new Promise((r) => setTimeout(r, 700));
+  const before = spawnSync('pgrep', ['-f', 'routlet-helper --mode local --listen 127.0.0.1:0'], { encoding: 'utf8' });
+  const pids = before.stdout.trim().split('\n').filter(Boolean);
+  // The newest matching helper belongs to this service.
+  process.kill(Number(pids.at(-1)), 'SIGKILL');
+
+  const service = await starting;
+  for (let i = 0; i < 50 && !logs.some((m) => m.includes('is back at')); i++) await new Promise((r) => setTimeout(r, 100));
+  const seen = await (await fetch(service.url)).json();
+  // The app was told one URL at launch; that is still the URL that works.
+  assert.equal(seen.host, new URL(service.url).host);
+  assert.ok(logs.some((m) => m.includes(`is back at ${service.url}`)), logs.join(' | '));
+});
+
 test('the CLI runs a service that another process can list, stop, and remove', async () => {
   const cli = path.resolve(import.meta.dirname, '..', 'src', 'cli.ts');
   const proc = spawn('node', [cli, 'run', '--name', 'from-cli', '--ingress', 'local', ...app], {

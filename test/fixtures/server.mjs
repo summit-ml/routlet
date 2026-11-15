@@ -21,5 +21,14 @@ server.on('upgrade', (_req, socket) => {
   socket.pipe(socket);
 });
 
+// SLOW_EXIT simulates an app that takes a while to shut down.
+if (process.env.SLOW_EXIT) {
+  process.on('SIGTERM', () => setTimeout(() => process.exit(0), Number(process.env.SLOW_EXIT)));
+}
+
 // IGNORE_PORT simulates an app that picks its own port no matter what it is told.
-server.listen(process.env.IGNORE_PORT ? 0 : Number(process.env.PORT), '127.0.0.1');
+// SLOW_START simulates one that takes a while to begin listening.
+setTimeout(
+  () => server.listen(process.env.IGNORE_PORT ? 0 : Number(process.env.PORT), '127.0.0.1'),
+  Number(process.env.SLOW_START ?? 0),
+);

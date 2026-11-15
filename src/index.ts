@@ -106,6 +106,11 @@ const active = new Map<string, RunningService>();
 
 const APPROVAL_CHECK_MS = 120_000;
 
+/** This machine's entry among the devices offering to host a service, if any. */
+async function findHost(secret: string, name: string, hostId: string) {
+  return (await serviceHosts(secret, name)).find((h) => h.nodeId === hostId);
+}
+
 /**
  * Make sure this machine's gateway is approved to host a service, approving it
  * through the API if it is not. Only ever touches the given host: another
@@ -113,7 +118,7 @@ const APPROVAL_CHECK_MS = 120_000;
  * Returns true if it had to approve.
  */
 async function ensureApproved(secret: string, name: string, hostId: string): Promise<boolean> {
-  const host = (await serviceHosts(secret, name)).find((h) => h.nodeId === hostId);
+  const host = await findHost(secret, name, hostId);
   if (!host) throw new RoutletError(`Tailscale does not list this machine as a host for "${name}".`, 'service_failed');
   if (isApproved(host)) return false;
   await approveHost(secret, name, hostId);
@@ -136,19 +141,11 @@ async function keepApproved(name: string, hostId: string | undefined, log: (mess
   }
 }
 
-async function openIngress(
-  name: string,
-  mode: IngressMode,
-  prev: ServiceRecord | undefined,
-  replace: boolean,
-  log: (message: string) => void,
-  signal?: AbortSignal,
-): Promise<Ingress> {
-  if (mode === 'local') {
-    const port = prev?.ingress === 'local' ? (prev.localPort ?? 0) : 0;
-    return startLocalIngress(`127.0.0.1:${port}`, log, signal);
-  }
-
+/**
+ * Claim a name on the tailnet for this machine: check nothing else has it and
+ * define the service if it is new. Done once, when a service starts.
+ */
+async function claimName(name: string, prev: ServiceRecord | undefined, replace: boolean): Promise<void> {
   const secret = loadSecret();
   const conflict = (why: string) => new RoutletError(`The name "${name}" ${why}`, 'name_conflict');
 
@@ -168,7 +165,30 @@ async function openIngress(
     }
   }
   if (!existing) await defineService(secret, name);
+}
 
+interface AttachOptions {
+  name: string;
+  mode: IngressMode;
+  /** Local mode: the fixed port to listen on, or 0 to pick one. */
+  localPort: number;
+  /**
+   * False when re-attaching a service that was already up. Approval was granted
+   * when it started and is watched separately, so a failure to confirm it (the
+   * Tailscale API being unreachable, say) must not stop the URL coming back
+   * after a purely local gateway restart.
+   */
+  mustApprove: boolean;
+  log: (message: string) => void;
+  signal?: AbortSignal;
+}
+
+/** Bring up the URL for a name this machine has already claimed. */
+function attach(opts: AttachOptions): Promise<Ingress> {
+  const { name, log, signal } = opts;
+  if (opts.mode === 'local') return startLocalIngress(`127.0.0.1:${opts.localPort}`, log, signal);
+
+  const secret = loadSecret();
   return startServiceIngress({
     name,
     onLog: log,
@@ -177,14 +197,22 @@ async function openIngress(
     approve: async (nodeId) => {
       // A device must be approved to host a service. Tailnets with an
       // autoApprovers rule do this themselves; otherwise approve it here.
-      // Tailscale takes a moment to list a host that has just advertised.
+      // Tailscale takes a moment to list a host that has just advertised, and
+      // a slow network is worth a retry too.
       for (let attempt = 0; ; attempt++) {
+        if (signal?.aborted) throw new RoutletError('Cancelled.', 'cancelled');
         try {
           await ensureApproved(secret, name, nodeId);
           return;
         } catch (err) {
-          if (attempt >= 40 || !(err instanceof RoutletError) || err.code !== 'service_failed') throw err;
-          await new Promise((r) => setTimeout(r, 500));
+          const retryable =
+            err instanceof RoutletError && (err.code === 'service_failed' || err.code === 'tailscale_unreachable');
+          if (retryable && attempt < 40) {
+            await new Promise((r) => setTimeout(r, 500).unref());
+            continue;
+          }
+          if (!opts.mustApprove) return;
+          throw err;
         }
       }
     },
@@ -241,10 +269,21 @@ export async function run(opts: RunOptions): Promise<RunningService> {
     // The URL can go away while the app is healthy: the gateway may crash or be
     // restarted. That is no reason to stop someone's dev server, so the ingress
     // is wrapped to bring the URL back behind the running app.
+    if (mode === 'tailscale') await claimName(name, prev, Boolean(opts.replace));
+    const first = await attach({
+      name,
+      mode,
+      localPort: prev?.ingress === 'local' ? (prev.localPort ?? 0) : 0,
+      mustApprove: true,
+      log,
+    });
+    // A replacement must come up at the address the app was told about, which
+    // for a local service is the port the first one actually got.
+    const localPort = mode === 'local' ? Number(new URL(first.url).port) : 0;
     const live = keepAlive({
       name,
-      first: await openIngress(name, mode, prev, Boolean(opts.replace), log),
-      open: (signal) => openIngress(name, mode, readRecord(name), true, log, signal),
+      first,
+      open: (signal) => attach({ name, mode, localPort, mustApprove: false, log, signal }),
       onLog: log,
       onState: (online) => {
         lock.offline = !online;
@@ -318,14 +357,16 @@ export async function run(opts: RunOptions): Promise<RunningService> {
         : undefined;
     approvalCheck?.unref();
 
-    // Everything that should stop the URL being repaired goes through here, so a
-    // helper dying as part of a shutdown is never mistaken for an outage.
-    const shutDown = () => {
+    // Shutting down has two steps. Repairs stop at once, so a helper dying as
+    // part of the shutdown is not mistaken for an outage. The URL itself stays
+    // up until the app has exited, so requests in flight are not cut off.
+    const beginShutdown = () => {
       clearInterval(approvalCheck);
-      live.stop();
+      live.quiesce();
     };
     const exited = exitCode.then((code) => {
-      shutDown();
+      beginShutdown();
+      live.stop();
       active.delete(name);
       releaseLock(name);
       return code;
@@ -339,7 +380,7 @@ export async function run(opts: RunOptions): Promise<RunningService> {
       child: proc,
       exited,
       stop: async () => {
-        shutDown();
+        beginShutdown();
         await terminateTree(pid);
         await exited;
       },
@@ -354,9 +395,16 @@ export async function run(opts: RunOptions): Promise<RunningService> {
   }
 }
 
-function toInfo(record: ServiceRecord): ServiceInfo {
+function withLock(record: ServiceRecord): { info: ServiceInfo; hostId?: string } {
   const lock = readLock(record.name);
-  return { ...record, running: Boolean(lock), pid: lock?.childPid, urlOffline: lock?.offline || undefined };
+  return {
+    info: { ...record, running: Boolean(lock), pid: lock?.childPid, urlOffline: lock?.offline || undefined },
+    hostId: lock?.hostId,
+  };
+}
+
+function toInfo(record: ServiceRecord): ServiceInfo {
+  return withLock(record).info;
 }
 
 /** Every known service, running or not. */
@@ -366,7 +414,7 @@ export function list(): ServiceInfo[] {
 
 async function approvalOf(name: string, hostId: string): Promise<boolean | undefined> {
   const check = (async () => {
-    const host = (await serviceHosts(loadSecret(), name)).find((h) => h.nodeId === hostId);
+    const host = await findHost(loadSecret(), name, hostId);
     return host ? isApproved(host) : undefined;
   })().catch(() => undefined);
   const timeout = new Promise<undefined>((resolve) => {
@@ -380,8 +428,7 @@ async function approvalOf(name: string, hostId: string): Promise<boolean | undef
 export async function inspect(name: string): Promise<ServiceDetails | undefined> {
   const record = readRecord(validateName(name));
   if (!record) return undefined;
-  const info = toInfo(record);
-  const hostId = readLock(record.name)?.hostId;
+  const { info, hostId } = withLock(record);
   // Both checks at once, and the network one is bounded, so a dead connection
   // cannot hold up what is otherwise a local status command.
   const [healthy, approved] = await Promise.all([

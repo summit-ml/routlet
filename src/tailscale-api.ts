@@ -29,17 +29,38 @@ export function hasSecret(): boolean {
   return readSecret() !== undefined;
 }
 
+/** fetch, with a timeout, reporting a dead or slow network as a RoutletError. */
+async function call(url: string, init: RequestInit, what: string): Promise<{ res: Response; text: string }> {
+  try {
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    return { res, text: await res.text() };
+  } catch (err) {
+    const why = err instanceof Error && err.name === 'TimeoutError' ? 'timed out' : err instanceof Error ? err.message : String(err);
+    throw new RoutletError(`Could not reach Tailscale while ${what} (${why}). Check your internet connection.`, 'tailscale_unreachable');
+  }
+}
+
+const parse = (text: string): any => {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+};
+
 async function request(secret: string, method: string, route: string, what: string, body?: unknown): Promise<any> {
   const token = await accessToken(secret);
-  const res = await fetch(`${API}${route}`, {
-    method,
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
+  const { res, text } = await call(
+    `${API}${route}`,
+    {
+      method,
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    },
+    what,
+  );
   if (res.status === 404 && method === 'GET') return undefined;
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
     const hint =
       // A missing scope is reported as 403, or as 404 for services.
       res.status === 403 || res.status === 404
@@ -47,7 +68,7 @@ async function request(secret: string, method: string, route: string, what: stri
         : '';
     throw new RoutletError(`Tailscale API: ${what} failed (${res.status}). ${text}${hint}`.trim(), 'tailscale_api');
   }
-  return res.json().catch(() => undefined);
+  return parse(text);
 }
 
 let cachedToken: { secret: string; token: string; expires: number } | undefined;
@@ -57,12 +78,12 @@ async function accessToken(secret: string): Promise<string> {
   if (cachedToken?.secret === secret && cachedToken.expires > Date.now()) return cachedToken.token;
   // The client ID is the third segment of the secret: tskey-client-<id>-<secret>.
   const clientId = secret.split('-')[2] ?? '';
-  const res = await fetch(`${API}/oauth/token`, {
-    method: 'POST',
-    body: new URLSearchParams({ client_id: clientId, client_secret: secret }),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  const json: any = await res.json().catch(() => ({}));
+  const { res, text } = await call(
+    `${API}/oauth/token`,
+    { method: 'POST', body: new URLSearchParams({ client_id: clientId, client_secret: secret }) },
+    'signing in',
+  );
+  const json: any = parse(text) ?? {};
   if (!res.ok || !json.access_token) {
     throw new RoutletError(
       `Tailscale rejected the OAuth client secret (${res.status}). Save a valid one with "routlet auth".`,

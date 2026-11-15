@@ -152,6 +152,7 @@ async function cmdInspect(argv: string[]): Promise<number> {
     ['url', details.url],
     ['status', details.running ? (details.healthy ? 'running' : 'running, not responding') : 'stopped'],
     ['ingress', details.ingress],
+    ['tailnet', details.approved === undefined ? '' : details.approved ? 'approved to serve' : 'NOT approved to serve (URL is down)'],
     ['app port', details.running ? String(details.port ?? '') : ''],
     ['pid', details.pid ? String(details.pid) : ''],
     ['directory', details.owner],

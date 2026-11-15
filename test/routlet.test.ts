@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -177,6 +177,30 @@ test('the secret is recognised by its format and can be supplied by environment 
   }
   // With no keychain there is nowhere to save it, and that is an error, not a silent file.
   assert.throws(() => store.storeSecret(secret), { code: 'no_keychain' });
+});
+
+test('the URL comes back by itself if its helper dies, and the app keeps running', async () => {
+  // Run once so the service has a fixed port, which makes its helper identifiable.
+  const first = await start('resilient');
+  const url = first.url;
+  await first.stop();
+
+  const logs: string[] = [];
+  const service = await start('resilient', { onLog: (m) => logs.push(m) });
+  assert.equal(service.url, url);
+  const helper = `routlet-helper --mode local --listen ${new URL(url).host}`;
+  spawnSync('pkill', ['-9', '-f', helper]);
+
+  let status = 0;
+  for (let i = 0; i < 100 && status !== 200; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    status = await fetch(url).then((r) => r.status, () => 0);
+  }
+  assert.equal(status, 200);
+  assert.ok(logs.some((m) => m.includes('went offline')));
+  assert.ok(logs.some((m) => m.includes('is back at')));
+  // Same app process throughout: it was never restarted.
+  assert.equal(routlet.list().find((s) => s.name === 'resilient')?.pid, service.pid);
 });
 
 test('the CLI runs a service that another process can list, stop, and remove', async () => {

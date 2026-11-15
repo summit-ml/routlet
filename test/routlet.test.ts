@@ -1,0 +1,208 @@
+import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { after, before, test } from 'node:test';
+
+// State must be isolated before the library reads it.
+const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'routlet-test-'));
+process.env.ROUTLET_STATE_DIR = stateDir;
+// No Tailscale credential is visible to the tests, whatever the developer has set up.
+delete process.env.ROUTLET_TS_KEY;
+process.env.ROUTLET_NO_KEYCHAIN = '1';
+
+const { adaptCommand } = await import('../src/adapt.ts');
+const { helperPath } = await import('../src/ingress.ts');
+const { validateName, RoutletError } = await import('../src/registry.ts');
+const routlet = await import('../src/index.ts');
+
+const fixture = path.resolve(import.meta.dirname, 'fixtures', 'server.mjs');
+const app = ['node', fixture];
+const started: Array<{ stop(): Promise<void> }> = [];
+
+async function start(name: string, extra: Partial<Parameters<typeof routlet.run>[0]> = {}) {
+  const service = await routlet.run({ name, command: app, ingress: 'local', stdio: 'ignore', ...extra });
+  started.push(service);
+  return service;
+}
+
+before(() => {
+  helperPath(); // fails with a clear message if the helper has not been built
+});
+
+after(async () => {
+  await Promise.all(started.map((s) => s.stop()));
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
+test('names must be DNS labels', () => {
+  assert.equal(validateName('api-workflow-portal'), 'api-workflow-portal');
+  for (const bad of ['', 'Has-Caps', 'under_score', '-lead', 'trail-', 'a.b', 'x'.repeat(64)]) {
+    assert.throws(() => validateName(bad), RoutletError, bad);
+  }
+});
+
+test('port flags are added only where the framework needs them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routlet-adapt-'));
+  const write = (scripts: Record<string, string>) =>
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ scripts }));
+
+  write({ dev: 'vite dev', api: 'node server.js', both: 'vite && node x.js', fixed: 'vite --port 3000', build: 'vite build', open: 'vite --open' });
+  assert.deepEqual(adaptCommand(['npm', 'run', 'build'], 4100, dir), ['npm', 'run', 'build']);
+  assert.deepEqual(adaptCommand(['npm', 'run', 'open'], 4100, dir), ['npm', 'run', 'open', '--', '--port', '4100', '--strictPort']);
+  assert.deepEqual(adaptCommand(['npx', 'vite', 'build'], 4100, dir), ['npx', 'vite', 'build']);
+  assert.deepEqual(adaptCommand(['npm', 'run', 'dev'], 4100, dir), ['npm', 'run', 'dev', '--', '--port', '4100', '--strictPort']);
+  assert.deepEqual(adaptCommand(['pnpm', 'dev'], 4100, dir), ['pnpm', 'dev', '--port', '4100', '--strictPort']);
+  assert.deepEqual(adaptCommand(['npx', 'vite'], 4100, dir), ['npx', 'vite', '--port', '4100', '--strictPort']);
+  // Left alone: reads PORT itself, compound script, or already has a port.
+  assert.deepEqual(adaptCommand(['npm', 'run', 'api'], 4100, dir), ['npm', 'run', 'api']);
+  assert.deepEqual(adaptCommand(['npm', 'run', 'both'], 4100, dir), ['npm', 'run', 'both']);
+  assert.deepEqual(adaptCommand(['npm', 'run', 'fixed'], 4100, dir), ['npm', 'run', 'fixed']);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('two services run at once on different ports, each behind its own URL', async () => {
+  const web = await start('web', { env: { LABEL: 'web' } });
+  const api = await start('api', { env: { LABEL: 'api' } });
+  assert.notEqual(web.port, api.port);
+  assert.notEqual(web.url, api.url);
+
+  const viaWeb = await (await fetch(`${web.url}/hello?x=1`)).json();
+  const viaApi = await (await fetch(api.url)).json();
+  assert.equal(viaWeb.label, 'web');
+  assert.equal(viaWeb.path, '/hello?x=1');
+  assert.equal(viaWeb.port, web.port);
+  assert.equal(viaApi.label, 'api');
+  // The app sees the public hostname, not localhost:<app port>.
+  assert.equal(viaWeb.host, new URL(web.url).host);
+
+  const listed = routlet.list();
+  assert.deepEqual(listed.map((s) => [s.name, s.running]), [['api', true], ['web', true]]);
+  assert.equal(routlet.url('web'), web.url);
+  assert.equal((await routlet.inspect('web'))?.healthy, true);
+});
+
+test('WebSocket upgrades pass through', async () => {
+  const service = await start('sockets');
+  const { port } = new URL(service.url);
+  const echoed = await new Promise<string>((resolve, reject) => {
+    const req = http.request({ port, host: '127.0.0.1', headers: { Connection: 'Upgrade', Upgrade: 'websocket' } });
+    req.on('upgrade', (_res, socket) => {
+      socket.once('data', (data) => {
+        socket.destroy();
+        resolve(data.toString());
+      });
+      socket.write('ping');
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(echoed, 'ping');
+});
+
+test('an app that ignores PORT is found on the port it actually chose', async () => {
+  const service = await start('stubborn', { env: { IGNORE_PORT: '1' } });
+  const seen = await (await fetch(service.url)).json();
+  assert.equal(seen.port, service.port);
+});
+
+test('the URL survives a restart and stays known while stopped', async () => {
+  const first = await start('restart');
+  const firstUrl = first.url;
+  await first.stop();
+  assert.equal(await first.exited, 128 + os.constants.signals.SIGTERM);
+  assert.equal(routlet.list().find((s) => s.name === 'restart')?.running, false);
+  assert.equal(routlet.url('restart'), firstUrl);
+
+  const second = await start('restart');
+  assert.equal(second.url, firstUrl);
+  assert.equal((await fetch(second.url)).status, 200);
+});
+
+test('services receive each other\'s URLs through their own env vars', async () => {
+  const backend = await start('backend');
+  const frontend = await start('frontend', { urlEnv: { API_URL: 'backend', SELF_URL: 'self' } });
+  const seen = await (await fetch(frontend.url)).json();
+  assert.equal(seen.apiUrl, backend.url);
+  assert.equal(seen.selfUrl, frontend.url);
+  // The app can really reach the other service at that URL.
+  assert.equal((await fetch(seen.apiUrl)).status, 200);
+  await assert.rejects(start('lost', { urlEnv: { API_URL: 'never-ran' } }), { code: 'not_found' });
+});
+
+test('name collisions fail instead of silently sharing or renaming', async () => {
+  await start('taken');
+  await assert.rejects(start('taken'), { code: 'already_running' });
+  await assert.rejects(start('taken', { cwd: os.tmpdir() }), { code: 'name_owned' });
+
+  // An explicit takeover is allowed and keeps the URL.
+  const before = routlet.url('taken');
+  const replaced = await start('taken', { replace: true });
+  assert.equal(replaced.url, before);
+});
+
+test('a command that fails to start reports why and leaves nothing behind', async () => {
+  await assert.rejects(start('broken', { command: ['node', '-e', 'process.exit(3)'] }), { code: 'app_exited' });
+  await assert.rejects(start('missing', { command: ['definitely-not-a-real-binary'] }), { code: 'spawn_failed' });
+  assert.equal(routlet.list().some((s) => s.name === 'broken' || s.name === 'missing'), false);
+  // The name is free again straight away.
+  const retry = await start('broken');
+  assert.equal((await fetch(retry.url)).status, 200);
+});
+
+test('without a Tailscale credential the default is a local URL, but an explicit request fails', async () => {
+  const logs: string[] = [];
+  const service = await start('fallback', { ingress: undefined, onLog: (m) => logs.push(m) });
+  assert.match(service.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+  assert.equal((await fetch(service.url)).status, 200);
+  assert.ok(logs.some((m) => m.includes('only works on this machine')));
+  await assert.rejects(start('insists', { ingress: 'tailscale' }), { code: 'no_credentials' });
+  assert.equal(routlet.list().some((s) => s.name === 'insists'), false);
+});
+
+test('the secret is recognised by its format and can be supplied by environment variable', async () => {
+  const store = await import('../src/secret-store.ts');
+  const secret = 'tskey-client-kABC123CNTRL-notARealSecret0123456789';
+  assert.equal(store.parseSecret(`TS_KEY=${secret}\n`), secret);
+  assert.equal(store.parseSecret('tskey-auth-kABC-nope'), undefined);
+
+  assert.equal(store.readSecret(), undefined);
+  process.env.ROUTLET_TS_KEY = secret;
+  try {
+    assert.deepEqual(store.readSecret(), { secret, source: 'env' });
+  } finally {
+    delete process.env.ROUTLET_TS_KEY;
+  }
+  // With no keychain there is nowhere to save it, and that is an error, not a silent file.
+  assert.throws(() => store.storeSecret(secret), { code: 'no_keychain' });
+});
+
+test('the CLI runs a service that another process can list, stop, and remove', async () => {
+  const cli = path.resolve(import.meta.dirname, '..', 'src', 'cli.ts');
+  const proc = spawn('node', [cli, 'run', '--name', 'from-cli', '--ingress', 'local', ...app], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  const exit = new Promise<number | null>((resolve) => proc.once('exit', resolve));
+  await new Promise<void>((resolve, reject) => {
+    let stderr = '';
+    proc.stderr.on('data', (chunk) => {
+      stderr += chunk;
+      if (stderr.includes('is live at')) resolve();
+    });
+    void exit.then((code) => reject(new Error(`CLI exited early (${code}): ${stderr}`)));
+  });
+
+  const info = routlet.list().find((s) => s.name === 'from-cli');
+  assert.equal(info?.running, true);
+  assert.equal((await fetch(info!.url)).status, 200);
+
+  assert.equal(await routlet.stop('from-cli'), true);
+  assert.equal(await exit, 128 + os.constants.signals.SIGTERM);
+  assert.equal(routlet.list().find((s) => s.name === 'from-cli')?.running, false);
+  assert.equal(await routlet.stop('from-cli'), false);
+
+  await routlet.remove('from-cli');
+  assert.equal(await routlet.inspect('from-cli'), undefined);
+});
